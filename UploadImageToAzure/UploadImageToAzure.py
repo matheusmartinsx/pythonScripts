@@ -3,98 +3,121 @@
 ###########################
 import csv
 import requests
-import shutil
 import os
 import requests.packages.urllib3
-import time
+from time import sleep
 from azure.core.exceptions import HttpResponseError, ResourceExistsError
 from azure.storage.blob import BlobServiceClient
+from azure.storage.blob import ContentSettings
+from urllib.error import HTTPError
+import socket
+import urllib
 
 requests.packages.urllib3.disable_warnings()
 
 try:
-    # Create target Directory
+    #Create target Directory
     os.mkdir('images')
     print("Directory 'images' Created ") 
 except FileExistsError:
     print("Directory 'images' already exists")
     
-#Adquire o caminho do script//Get the main file path to script
+#Get the main file path to script
 my_path = os.getcwd()
 my_path = my_path.replace('\\','/')
-#Recebe e armazena os parametros//Receive and save the user parameters
-sourceFile = str(input('Insert your base csv file name (Without extension): '))
+#//Receive and save the user parameters
 my_acc = str(input('Insert you Azure account name: '))
 my_container = str(input('Insert your container name: '))
-my_path.replace("\\","/")
-linkIndex = int(input('Insert the link index of the CSV File (Starting at 0): '))
-nameIndex = int(input('Insert the name index of the CSV File: '))
-
 connection_string = str(input('Paste your Azure Storage Connection String here: ')) #OR os.getenv('AZURE_STORAGE_CONNECTION_STRING')
-#Inicia um novo blob service // Start a new Blob
+
+#Start a new Blob
 blob_service_client = BlobServiceClient.from_connection_string(connection_string)
-#Inicia um novo container // Start a new container
+#Start a new container
 container_client = blob_service_client.get_container_client(my_container)
-#Crie o container // Creates the container
+#Creates the container
 try:
     container_client.create_container()
 except ResourceExistsError:
     pass
 
-#Criar CSV para atualizações // Creates the update CSV *CHANGE YOUR FILE PATH*
-with open(my_path+'/atualizados.csv', 'a',newline='',encoding="utf8") as c:
-    writer = csv.writer(c)
-    writer.writerow(['EAN', 'Produto', 'Img_Link'])
-time.sleep(0.2)
-#Insere o inicio do link // Insert's the link prefix
+#Saves your blob URL
 urlPre = 'https://'+my_acc+'.blob.core.windows.net/'+my_container+'/'
 
-#Carregar CSV em um lista // Load the CSV into a list
-csvLinks = []
-with open(my_path +'/'+ sourceFile +'.csv',newline='', encoding="utf8") as csvfile:
-    rows = csv.reader(csvfile, delimiter=',')
-    for row in rows:
-        csvLinks.append(row)
-imagensBaixadas = []
-#Fazer download das imagens // Donwload the images
-for i in range(len(csvLinks)):
-    if csvLinks[i][nameIndex] == '' or 'http' not in csvLinks[i][linkIndex]:
-        continue
-    #Requisitar a URL da imagem, ignorando verificação// Request image URL, skipping verification
-    try:
-        img = requests.get(csvLinks[i][linkIndex], stream = True, verify = False)
-    except:
-        with open(my_path+'/naoBaixados.csv', 'a',newline='', encoding="utf8") as c:
-            writer = csv.writer(c)
-            writer.writerow([csvLinks[i]])
-        continue
-    #Se o status do link for diferente de 200 (link saudável), pule pro próximo// If the link status is not 200 (Health link), skip to next link
-    if img.status_code != 200:
-        with open(my_path+'/naoBaixados.csv', 'a',newline='', encoding="utf8") as c:
-            writer = csv.writer(c)
-            writer.writerow([csvLinks[i]])
-        continue
-    #Se não, salve a imagem na pasta 'imagens', com o primeiro campo do CSV como nome// If not, save the image to folder and use the first CSV field as the name
-    else:
-        file = open('images/'+ str(csvLinks[i][nameIndex]) +'.jpg', 'wb')
-        file.write(img.content)
-        file.close()
-        nomeImagem = str(csvLinks[i][nameIndex])
-        print('Imagem ['+ nomeImagem +'.jpg] baixada')
-        imagensBaixadas.append(nomeImagem)
-    time.sleep(0.5)
-    #Criar novo CSV para exportação // Create a new and updated CSV
-    with open(my_path+'/atualizados.csv', 'a', newline='', encoding="utf8") as c:
-        writer = csv.writer(c)
-        writer.writerow([csvLinks[i][0],csvLinks[i][1],urlPre+str(nomeImagem)+'.jpg'])
+def downloadImages(prefix='', stopRefeed=True):
+    '''
+    Function set do download images from a csv file arranged as 'name - link'
+    If there is more than one link in a row, the function will add a '_X' at the end of the name.
     
-urlUploads = []
-for i in range(len(imagensBaixadas)):
-    # Upload de imagens para o container // Upload images to container
-    with open('imagens/'+imagensBaixadas[i]+'.jpg', "rb") as f:
-        container_client.upload_blob(name=str(imagensBaixadas[i]+'.jpg'), data=f, overwrite=True)
-        print('Upload da imagem ['+imagensBaixadas[i]+'.jpg] concluído. - '+ str(i+1) + '/'+str(len(imagensBaixadas)))
-        urlUploads.append(urlPre+str(imagensBaixadas[i]+'.jpg'))
-        print('URL da Imagem: ['+urlUploads[i]+']')
-    time.sleep(0.5)
-    # Fim do Upload // End Upload
+    This function can also receive a prefix to put before the name that will be saved, and a Re Download protection
+    where it will skip any link that is already in your Azure informed container.
+    '''
+    hdr = {'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/74.0.3729.169 Safari/537.36'}
+    sourceFile = str(input('Insert your base csv file name (Without extension): '))
+
+    #Carregar CSV em um lista // Load the CSV into a list
+    with open(my_path +'/'+ sourceFile +'.csv','r', encoding="utf8") as c:
+        rows = list(csv.reader(c))
+    downloaded = 0
+    
+    for i in range(len(rows)):
+        print('Downloading image '+ str(i+1)+' of '+ str(len(rows)))
+        imgLinks = []
+        codigo = rows[i][0]
+        for j in range(len(rows[i])):
+            if stopRefeed:
+                if urlPre in rows[i][j]:
+                    continue
+            if 'http' in rows[i][j]:
+                imgLinks.append(rows[i][j])
+            else:
+                continue
+        cont = 0
+        imagem = ''
+        num = ''
+        for l in range(len(imgLinks)):
+            if cont > 0:
+                num = '_' + str(cont)
+            try:
+                req = urllib.request.Request(imgLinks[l], headers=hdr)
+                response = urllib.request.urlopen(req, timeout=5)
+                file = open(f'images/{prefix}{codigo}{num}.jpg', 'wb')
+                file.write(response.read())
+                file.close()
+            except UnicodeEncodeError:
+                response = requests.get(imgLinks[l], timeout=5)
+                file = open(f'images/{prefix}{codigo}{num}.jpg', 'wb')
+                file.write(response.content)
+                file.close()
+            except HTTPError as err:
+                with open('error.csv', 'a', newline='', encoding='UTF-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([codigo,str(err), imgLinks[l]])
+                    print(f'Error downloading image: {err}')
+                continue
+            except socket.timeout:
+                with open('error.csv', 'a', newline='', encoding='UTF-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([codigo,'Timeout Err', imgLinks[l]])
+                    print(f'Error downloading image: Connection Timeout')
+                continue
+            downloaded += 1
+            imagem += f'{prefix}{codigo}{num}.jpg, '
+            sleep(0.5)
+            cont += 1
+    print(f'{downloaded} images succesfully downloaded.')
+                
+def uploadImages():
+    myFiles = [f for f in os.listdir(my_path+ '/images') if os.path.isfile(os.path.join(my_path+'/images', f))]
+    my_content = ContentSettings(content_type='image/jpeg')
+
+    for i in range(len(myFiles)):
+        # Upload de imagens para o container // Upload images to container
+        with open('images/'+myFiles[i], "rb") as f:
+            fileName = myFiles[i].split('.')[0]
+            urlUploads = (urlPre + str(myFiles[i]))
+            container_client.upload_blob(name=str(myFiles[i]), data=f, overwrite=True,content_settings= my_content)
+            print('Image ['+ myFiles[i] +'] upload completed. - '+ str(i+1) + '/'+str(len(myFiles)))
+            print('Image URL:   ['+urlUploads+']')
+        
+downloadImages()
+uploadImages()
